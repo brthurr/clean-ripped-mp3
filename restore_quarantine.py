@@ -5,6 +5,9 @@ Restore quarantined MP3 files back to their original locations.
 Reads the corrupted_files.log produced by detect_corrupted.py and moves
 files from the quarantine directory back to where they came from.
 
+Handles the _1/_2/... collision suffixes that detect_corrupted.py adds
+when two files with the same name are quarantined from different folders.
+
 Usage:
     # Restore everything in the quarantine
     python restore_quarantine.py --log /mnt/media/music/corrupted_files.log \
@@ -20,12 +23,11 @@ import argparse
 import shutil
 import sys
 from pathlib import Path
+from typing import Optional
 
 
 def parse_log(log_path: Path) -> list[tuple[Path, float]]:
-    """
-    Parse corrupted_files.log and return (original_path, score) pairs.
-    """
+    """Parse corrupted_files.log and return (original_path, score) pairs."""
     entries = []
     current_path = None
     current_score = None
@@ -42,10 +44,29 @@ def parse_log(log_path: Path) -> list[tuple[Path, float]]:
                     current_path = None
                     current_score = None
             elif not line.startswith(" "):
-                # Unindented non-comment line is a file path
                 current_path = Path(line.strip())
 
     return entries
+
+
+def find_in_quarantine(quarantine_dir: Path, filename: str,
+                       claimed: set) -> Optional[Path]:
+    """
+    Find a file in quarantine by name, falling back to _1/_2/... variants
+    added when multiple files shared the same name during quarantine.
+    Only returns paths that haven't already been claimed by a prior restore.
+    """
+    stem   = Path(filename).stem
+    suffix = Path(filename).suffix
+
+    candidates = [quarantine_dir / filename]
+    for n in range(1, 50):
+        candidates.append(quarantine_dir / f"{stem}_{n}{suffix}")
+
+    for p in candidates:
+        if p.exists() and p not in claimed:
+            return p
+    return None
 
 
 def main():
@@ -74,7 +95,7 @@ Examples:
                         help="Show what would be restored without moving anything")
     args = parser.parse_args()
 
-    log_path = Path(args.log).expanduser().resolve()
+    log_path      = Path(args.log).expanduser().resolve()
     quarantine_dir = Path(args.quarantine).expanduser().resolve()
 
     if not log_path.exists():
@@ -89,7 +110,6 @@ Examples:
         print("No entries found in log file.")
         sys.exit(0)
 
-    # Filter by score threshold if requested
     if args.below is not None:
         candidates = [(p, s) for p, s in entries if s < args.below]
         print(f"Found {len(entries)} total log entries, "
@@ -108,12 +128,13 @@ Examples:
     restored = 0
     skipped  = 0
     missing  = 0
+    claimed: set[Path] = set()   # quarantine files already matched
 
     for original_path, score in candidates:
-        filename = original_path.name
-        quarantine_file = quarantine_dir / filename
+        filename       = original_path.name
+        quarantine_file = find_in_quarantine(quarantine_dir, filename, claimed)
 
-        if not quarantine_file.exists():
+        if quarantine_file is None:
             print(f"  NOT IN QUARANTINE ({score:.2f})  {filename}")
             missing += 1
             continue
@@ -123,22 +144,25 @@ Examples:
             skipped += 1
             continue
 
+        renamed = quarantine_file.name != filename
+        display = (f"{quarantine_file.name} → {original_path}"
+                   if renamed else str(original_path))
+
         if args.dry_run:
-            print(f"  would restore  ({score:.2f})  {filename}")
-            print(f"                 → {original_path}")
+            print(f"  would restore  ({score:.2f})  {display}")
+            claimed.add(quarantine_file)
             restored += 1
             continue
 
-        # Recreate parent directory if needed
         original_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
             shutil.move(str(quarantine_file), str(original_path))
-            print(f"  restored  ({score:.2f})  {filename}")
-            print(f"            → {original_path}")
+            claimed.add(quarantine_file)
+            print(f"  restored  ({score:.2f})  {display}")
             restored += 1
         except OSError as exc:
-            print(f"  ERROR moving {filename}: {exc}", file=sys.stderr)
+            print(f"  ERROR moving {quarantine_file.name}: {exc}", file=sys.stderr)
             skipped += 1
 
     print(f"\n{'─'*60}")
