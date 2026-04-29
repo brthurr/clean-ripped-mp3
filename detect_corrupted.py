@@ -8,6 +8,8 @@ Uses multiple heuristics:
   - MP3 frame-level scanning (sync byte ratio, invalid headers)
   - file truncation detection
   - frame count vs reported duration mismatch
+  - mp3val structural validation (if installed)
+  - ffmpeg full decode check (if installed) — catches garbled audio in valid frames
 
 Usage:
     python detect_corrupted.py /path/to/music [options]
@@ -17,6 +19,7 @@ import argparse
 import os
 import shutil
 import struct
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +31,14 @@ try:
 except ImportError:
     print("Error: mutagen is required.  Run: pip install mutagen")
     sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# External tool detection
+# ---------------------------------------------------------------------------
+
+FFMPEG  = shutil.which("ffmpeg")
+MP3VAL  = shutil.which("mp3val")
 
 
 # ---------------------------------------------------------------------------
@@ -73,11 +84,11 @@ def _parse_frame_header(data: bytes, offset: int) -> Optional[int]:
     if b0 != 0xFF or (b1 & 0xE0) != 0xE0:
         return None
 
-    ver_bits  = (b1 >> 3) & 0x03
+    ver_bits   = (b1 >> 3) & 0x03
     layer_bits = (b1 >> 1) & 0x03
-    br_idx    = (b2 >> 4) & 0x0F
-    sr_idx    = (b2 >> 2) & 0x03
-    padding   = (b2 >> 1) & 0x01
+    br_idx     = (b2 >> 4) & 0x0F
+    sr_idx     = (b2 >> 2) & 0x03
+    padding    = (b2 >> 1) & 0x01
 
     mpeg_ver = _MPEG_VER_BITS.get(ver_bits)
     layer    = _LAYER_BITS.get(layer_bits)
@@ -93,7 +104,7 @@ def _parse_frame_header(data: bytes, offset: int) -> Optional[int]:
     if bitrates is None:
         return None
 
-    bitrate    = bitrates[br_idx] * 1000   # bps
+    bitrate     = bitrates[br_idx] * 1000   # bps
     sample_rate = _SAMPLE_RATE[mpeg_ver][sr_idx]
 
     if layer == 1:
@@ -129,13 +140,85 @@ def _skip_id3v2(data: bytes) -> int:
 
 
 # ---------------------------------------------------------------------------
+# External tool checks
+# ---------------------------------------------------------------------------
+
+def _check_mp3val(path: Path, result: "CheckResult") -> None:
+    """Run mp3val and add flags for any errors or warnings it finds."""
+    try:
+        proc = subprocess.run(
+            [MP3VAL, str(path)],
+            capture_output=True, text=True, timeout=30
+        )
+        output = proc.stdout + proc.stderr
+        errors   = [l for l in output.splitlines() if l.startswith("ERROR")]
+        warnings = [l for l in output.splitlines() if l.startswith("WARNING")]
+        result.details["mp3val_errors"]   = len(errors)
+        result.details["mp3val_warnings"] = len(warnings)
+        if errors:
+            result.add("mp3val_error", 0.35,
+                       f"{len(errors)} error(s): {errors[0][:80]}")
+        elif warnings:
+            result.add("mp3val_warning", 0.15,
+                       f"{len(warnings)} warning(s): {warnings[0][:80]}")
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+# ffmpeg error lines that reliably indicate corrupted audio data
+_FFMPEG_ERROR_PATTERNS = (
+    "error",
+    "invalid",
+    "corrupt",
+    "huffman",
+    "overread",
+    "out of range",
+    "bad",
+    "header missing",
+    "noise",
+)
+
+
+def _check_ffmpeg(path: Path, result: "CheckResult") -> None:
+    """
+    Decode the entire file with ffmpeg (null output) and count decode errors.
+    This catches garbled audio inside structurally valid frames — the
+    'plays fine then turns to Atari noise' pattern.
+    """
+    try:
+        proc = subprocess.run(
+            [FFMPEG, "-v", "error", "-i", str(path), "-f", "null", "-"],
+            capture_output=True, text=True, timeout=120
+        )
+        # ffmpeg writes decode errors to stderr
+        error_lines = [
+            l for l in proc.stderr.splitlines()
+            if any(p in l.lower() for p in _FFMPEG_ERROR_PATTERNS)
+        ]
+        error_count = len(error_lines)
+        result.details["ffmpeg_decode_errors"] = error_count
+        if error_count > 20:
+            result.add("ffmpeg_decode_errors_high", 0.75,
+                       f"{error_count} decode errors (heavily corrupted audio)")
+        elif error_count > 5:
+            result.add("ffmpeg_decode_errors_moderate", 0.55,
+                       f"{error_count} decode errors (significant corrupted section)")
+        elif error_count > 0:
+            result.add("ffmpeg_decode_errors_low", 0.30,
+                       f"{error_count} decode error(s) (minor or isolated glitch)")
+    except subprocess.TimeoutExpired:
+        result.details["ffmpeg_decode_errors"] = "timeout"
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Corruption checks
 # ---------------------------------------------------------------------------
 
-MIN_FILE_BYTES  = 8_192    # 8 KB – anything smaller is almost certainly junk
-MIN_DURATION_S  = 2.0      # seconds – shorter than this is suspicious
-FRAME_SCAN_BYTES = 512_000 # how many bytes to scan for frame analysis (512 KB)
-MAX_SEEK_BYTES   = 2048    # max bytes to scan while hunting for next sync
+MIN_FILE_BYTES   = 8_192    # 8 KB – anything smaller is almost certainly junk
+MIN_DURATION_S   = 2.0      # seconds – shorter than this is suspicious
+FRAME_SCAN_BYTES = 512_000  # how many bytes to scan for frame analysis (512 KB)
 
 
 @dataclass
@@ -151,7 +234,7 @@ class CheckResult:
             self.details[flag] = detail
 
 
-def check_file(path: Path) -> CheckResult:
+def check_file(path: Path, use_ffmpeg: bool = True, use_mp3val: bool = True) -> CheckResult:
     result = CheckResult()
 
     # --- 1. Basic file size ---
@@ -184,10 +267,10 @@ def check_file(path: Path) -> CheckResult:
         offset = _skip_id3v2(raw)
         data_len = len(raw)
 
-        valid_frames   = 0
-        invalid_bytes  = 0
-        frame_samples  = 0
-        first_sr       = None
+        valid_frames    = 0
+        invalid_bytes   = 0
+        frame_samples   = 0
+        first_sr        = None
         inconsistent_sr = False
         consecutive_bad = 0
         max_consecutive_bad = 0
@@ -196,7 +279,6 @@ def check_file(path: Path) -> CheckResult:
             frame_size = _parse_frame_header(raw, offset)
 
             if frame_size is not None and (offset + frame_size) <= data_len:
-                # Optionally verify next-frame sync (lookahead)
                 next_off = offset + frame_size
                 if next_off + 4 <= data_len:
                     next_ok = (_parse_frame_header(raw, next_off) is not None
@@ -207,8 +289,7 @@ def check_file(path: Path) -> CheckResult:
                 if next_ok:
                     valid_frames += 1
                     consecutive_bad = 0
-                    # Collect sample rate for consistency
-                    sr_idx  = (raw[offset + 2] >> 2) & 0x03
+                    sr_idx   = (raw[offset + 2] >> 2) & 0x03
                     ver_bits = (raw[offset + 1] >> 3) & 0x03
                     mpeg_ver = _MPEG_VER_BITS.get(ver_bits)
                     if mpeg_ver and sr_idx < 3:
@@ -217,19 +298,17 @@ def check_file(path: Path) -> CheckResult:
                             first_sr = sr
                         elif sr != first_sr:
                             inconsistent_sr = True
-                    # Estimate samples per frame (Layer III / MPEG1 = 1152)
                     frame_samples += 1152
                     offset += frame_size
                     continue
 
-            # Invalid byte – advance one byte and count as junk
             invalid_bytes += 1
             consecutive_bad += 1
             max_consecutive_bad = max(max_consecutive_bad, consecutive_bad)
             offset += 1
 
-        result.details["valid_frames"] = valid_frames
-        result.details["invalid_bytes"] = invalid_bytes
+        result.details["valid_frames"]            = valid_frames
+        result.details["invalid_bytes"]           = invalid_bytes
         result.details["max_consecutive_bad_bytes"] = max_consecutive_bad
 
         total_scanned = data_len - _skip_id3v2(raw)
@@ -252,7 +331,6 @@ def check_file(path: Path) -> CheckResult:
 
         # --- 4. Duration consistency ---
         if reported_duration > 0 and frame_samples > 0:
-            # frame_samples counted over FRAME_SCAN_BYTES; estimate full count
             scan_fraction = min(1.0, FRAME_SCAN_BYTES / size)
             estimated_frames_total = valid_frames / scan_fraction if scan_fraction > 0 else valid_frames
             estimated_duration = (estimated_frames_total * 1152) / 44100
@@ -264,11 +342,9 @@ def check_file(path: Path) -> CheckResult:
                            f"reported {reported_duration:.1f} s ({ratio:.0%} off)")
 
         # --- 5. Truncation check ---
-        # Read the last few bytes to see if file ends with a valid frame or garbage
         with open(path, "rb") as fh:
             fh.seek(max(0, size - 256))
             tail = fh.read(256)
-        # Look for a sync byte in the tail; absence suggests truncation
         has_tail_sync = any(
             tail[i] == 0xFF and (tail[i + 1] & 0xE0) == 0xE0
             for i in range(len(tail) - 1)
@@ -279,6 +355,14 @@ def check_file(path: Path) -> CheckResult:
 
     except OSError as exc:
         result.add("read_error", 0.8, str(exc))
+
+    # --- 6. mp3val structural check ---
+    if use_mp3val and MP3VAL:
+        _check_mp3val(path, result)
+
+    # --- 7. ffmpeg full decode check ---
+    if use_ffmpeg and FFMPEG:
+        _check_ffmpeg(path, result)
 
     return result
 
@@ -311,13 +395,16 @@ Actions (choose one, or omit for report-only):
   --delete      Delete suspected-corrupt files (IRREVERSIBLE)
 
 Examples:
-  # Just report
-  python detect_corrupted.py /media/usb/music
+  # Full scan (uses ffmpeg + mp3val if available)
+  python detect_corrupted.py /media/usb/music -r
 
-  # Report and move bad files to a quarantine folder
-  python detect_corrupted.py /media/usb/music --move /tmp/corrupted
+  # Fast structural-only scan (skips ffmpeg decoding)
+  python detect_corrupted.py /media/usb/music -r --fast
 
-  # Recursive scan, higher sensitivity
+  # Move bad files to a quarantine folder for review
+  python detect_corrupted.py /media/usb/music -r --move ~/quarantine
+
+  # More sensitive threshold
   python detect_corrupted.py /media/usb/music -r --threshold 0.3
 """)
     parser.add_argument("directory",
@@ -331,6 +418,8 @@ Examples:
                         help="Move files above threshold to DEST_DIR")
     parser.add_argument("--delete", action="store_true",
                         help="Delete files above threshold")
+    parser.add_argument("--fast", action="store_true",
+                        help="Skip ffmpeg decode check (faster, misses garbled audio)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show details for every file, not just flagged ones")
     parser.add_argument("--no-color", action="store_true",
@@ -354,6 +443,17 @@ Examples:
         dest_dir = Path(args.move).expanduser().resolve()
         dest_dir.mkdir(parents=True, exist_ok=True)
 
+    # Report which tools are active
+    tools = []
+    if not args.fast and FFMPEG:
+        tools.append("ffmpeg (deep decode)")
+    elif not args.fast and not FFMPEG:
+        tools.append("ffmpeg not found — install for deep decode checks")
+    if MP3VAL:
+        tools.append("mp3val (structural)")
+    print(f"Active checks: frame-scan + mutagen" +
+          (f" + {' + '.join(tools)}" if tools else ""))
+
     mp3s = find_mp3s(root, args.recursive)
     if not mp3s:
         print(f"No MP3 files found in '{root}'")
@@ -365,19 +465,13 @@ Examples:
     clean_count = 0
 
     for i, mp3 in enumerate(mp3s, 1):
-        result = check_file(mp3)
+        result = check_file(mp3, use_ffmpeg=not args.fast)
         rel = mp3.relative_to(root)
 
         if result.score >= args.threshold:
             corrupted.append((mp3, result))
             score_str = format_score(result.score)
             print(f"[{i:>4}/{len(mp3s)}] SUSPECT  {score_str}  {rel}")
-            for flag, detail in result.details.items():
-                if flag not in ("file_size", "bitrate", "reported_duration",
-                                "valid_frames", "invalid_bytes",
-                                "max_consecutive_bad_bytes", "junk_ratio",
-                                "estimated_duration"):
-                    continue
             for flag in result.flags:
                 detail = result.details.get(flag, "")
                 detail_str = f" – {detail}" if detail else ""
@@ -410,7 +504,6 @@ Examples:
         print(f"\nMoving {len(corrupted)} file(s) to '{dest_dir}' …")
         for path, _ in corrupted:
             dest = dest_dir / path.name
-            # Avoid overwriting if two files share a name
             if dest.exists():
                 stem, suffix = dest.stem, dest.suffix
                 counter = 1

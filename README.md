@@ -6,17 +6,25 @@ Scans a directory of MP3 files and identifies corrupted ones — particularly us
 
 Each file is scored from 0.0 (clean) to 1.0 (definitely corrupt) using multiple checks:
 
-| Check | What it catches |
-|---|---|
-| mutagen parse failure | completely unreadable files |
-| no valid MP3 frames | random/garbled byte streams |
-| high junk byte ratio (>30%) | partially garbled rips |
-| moderate junk byte ratio (>10%) | lightly corrupted sections |
-| zero duration | empty or headerless files |
-| tiny file (<8 KB) | files truncated during rip |
-| very short duration (<2 s) | obviously incomplete tracks |
-| no sync bytes near end of file | file cut off mid-stream |
-| frame count vs reported duration mismatch | misreported length |
+| Check | Tool | What it catches |
+|---|---|---|
+| mutagen parse failure | mutagen | completely unreadable files |
+| no valid MP3 frames | built-in | random/garbled byte streams |
+| high junk byte ratio (>30%) | built-in | partially garbled rips |
+| moderate junk byte ratio (>10%) | built-in | lightly corrupted sections |
+| zero duration | mutagen | empty or headerless files |
+| tiny file (<8 KB) | built-in | files truncated during rip |
+| very short duration (<2 s) | built-in | obviously incomplete tracks |
+| no sync bytes near end of file | built-in | file cut off mid-stream |
+| frame count vs reported duration mismatch | built-in | misreported length |
+| structural errors/warnings | mp3val | header/side-info inconsistencies |
+| 1–5 decode errors | ffmpeg | isolated glitches |
+| 6–20 decode errors | ffmpeg | significant corrupted section |
+| 20+ decode errors | ffmpeg | heavily corrupted audio |
+
+The **ffmpeg decode check** is the most powerful — it fully decodes every frame and catches
+garbled audio data inside structurally valid frames (the "plays fine then turns to noise" pattern
+common in bad CD rips). `mp3val` and `ffmpeg` are used automatically if installed.
 
 Files scoring **0.40 or above** are flagged as suspect (adjustable with `--threshold`).
 
@@ -79,6 +87,12 @@ Lower threshold = more sensitive (catches marginal files):
 python detect_corrupted.py /path/to/music -r --threshold 0.30
 ```
 
+### Fast structural-only scan (skips ffmpeg decoding)
+
+```bash
+python detect_corrupted.py /path/to/music -r --fast
+```
+
 ### Show all files including clean ones
 
 ```bash
@@ -110,6 +124,7 @@ options:
   --threshold FLOAT     Corruption score threshold 0.0–1.0 (default: 0.40)
   --move DEST_DIR       Move suspect files to DEST_DIR
   --delete              Delete suspect files (irreversible)
+  --fast                Skip ffmpeg decode check (faster, misses garbled audio)
   --verbose, -v         Show all files, not just flagged ones
   --no-color            Disable ANSI color output
 ```
